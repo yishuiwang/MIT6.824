@@ -1,13 +1,14 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
 	"os"
 	"sort"
 )
-import "log"
-import "net/rpc"
-import "hash/fnv"
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -36,109 +37,123 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-	args := &RpcArgs{
-		Request: "hello",
+	args := &NeedWorkArgs{}
+
+	reply := &NeedWorkReply{}
+
+	for {
+		// wait for the coordinator to assign a task
+		if err := AskOneTask(args, reply); err != nil {
+			log.Fatalf("cannot get task from coordinator")
+		}
+		switch reply.Task.Type {
+		case "map":
+			DoMapTask(mapf, reply)
+			TaskDone(&FinishWorkArgs{
+				TaskId: reply.Task.TaskId,
+				Type:   "map",
+			})
+		case "reduce":
+			DoReduceTask(reducef, reply)
+			TaskDone(&FinishWorkArgs{
+				ReduceId: reply.Task.ReduceId,
+				Type:     "reduce",
+			})
+		case "done":
+			fmt.Println("all tasks done!")
+			return
+		}
 	}
 
-	reply := &RpcReply{}
+}
 
-	// uncomment to send the Example RPC to the coordinator.
-	CallCoordinator(args, reply)
+// read each input file,
+// pass it to Map,
+// accumulate the intermediate Map output.
 
-	intermediate := []KeyValue{}
-
-	file, err := os.Open(reply.FileName)
+func DoMapTask(mapf func(string, string) []KeyValue, reply *NeedWorkReply) {
+	filename := reply.Task.FileName
+	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatalf("cannot open %v", reply.FileName)
+		log.Fatalf("cannot open %v", filename)
 	}
-	content, err := os.ReadFile(reply.FileName)
+	content, err := os.ReadFile(filename)
 	if err != nil {
-		log.Fatalf("cannot read %v", reply.FileName)
+		log.Fatalf("cannot read %v", filename)
 	}
 	file.Close()
-	kva := mapf(reply.FileName, string(content))
-	intermediate = append(intermediate, kva...)
+	kva := mapf(filename, string(content))
 
-	sort.Sort(ByKey(intermediate))
+	for _, kv := range kva {
+		reduceId := ihash(kv.Key) % reply.ReduceCnt
+		tfName := fmt.Sprintf("mr-%v-%v", reply.Task.TaskId, reduceId)
+		tf, _ := os.OpenFile(tfName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		enc := json.NewEncoder(tf)
+		enc.Encode(&kv)
+		tf.Close()
+	}
+	//TaskDone(reply.Id)
+}
 
-	oname := fmt.Sprintf("mr-out-%d", reply.Seq)
-	ofile, _ := os.Create(oname)
+func DoReduceTask(reducef func(string, []string) string, reply *NeedWorkReply) {
+	oname := fmt.Sprintf("mr-out-%v", reply.Task.ReduceId)
+	ofile, err := os.Create(oname)
+	if err != nil {
+		log.Fatalf("cannot create %v", oname)
+	}
+
+	kva := []KeyValue{}
+	// todo oops!
+	for i := 0; i < reply.ReduceCnt; i++ {
+		tfName := fmt.Sprintf("mr-%v-%v", i, reply.Task.ReduceId)
+		tf, _ := os.Open(tfName)
+		dec := json.NewDecoder(tf)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+		tf.Close()
+	}
+	sort.Sort(ByKey(kva))
 
 	i := 0
-	for i < len(intermediate) {
+	for i < len(kva) {
 		j := i + 1
-		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+		for j < len(kva) && kva[j].Key == kva[i].Key {
 			j++
 		}
 		values := []string{}
 		for k := i; k < j; k++ {
-			values = append(values, intermediate[k].Value)
+			values = append(values, kva[k].Value)
 		}
-		output := reducef(intermediate[i].Key, values)
+		output := reducef(kva[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
 
 		i = j
 	}
 	ofile.Close()
-
-	//CallDone()
-}
-
-func CallDone() {
-	args := &RpcArgs{
-		Request:  "job is completely finished",
-		Finished: true,
-	}
-
-	reply := &RpcReply{}
-	ok := call("Coordinator.RpcDone", args, reply)
-
-	if ok {
-		//fmt.Println("the worker processes exit.")
-	} else {
-		//fmt.Printf("oops! something went wrong!\n")
-	}
-}
-
-func CallCoordinator(args *RpcArgs, reply *RpcReply) {
-
-	ok := call("Coordinator.RpcHandler", &args, &reply)
-
-	if ok {
-		//fmt.Println("call success!")
-	} else {
-		//fmt.Printf("call failed!\n")
-	}
+	//TaskDone(reply.Id)
 
 }
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
+func AskOneTask(args *NeedWorkArgs, reply *NeedWorkReply) error {
+	ok := call("Coordinator.ResponseOneTask", &args, &reply)
 
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
 	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
+		return nil
 	} else {
-		fmt.Printf("call failed!\n")
+		return fmt.Errorf("oops! something went wrong!\n")
 	}
+}
+
+func TaskDone(args *FinishWorkArgs) {
+	reply := &FinishWorkReply{}
+	call("Coordinator.TaskDone", &args, &reply)
 }
 
 // send an RPC request to the coordinator, wait for the response.
