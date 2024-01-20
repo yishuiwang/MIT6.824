@@ -8,8 +8,8 @@ package mr
 
 import (
 	"os"
-	"strconv"
 )
+import "strconv"
 
 //
 // example to show how to declare the arguments
@@ -24,24 +24,32 @@ const (
 	Finished
 )
 
+type TaskType string
+
+const (
+	MapTask    TaskType = "map"
+	ReduceTask TaskType = "reduce"
+	Done       TaskType = "done"
+)
+
 type Task struct {
-	Type      string
 	FileName  string
 	TaskId    int
 	ReduceId  int
 	Status    TaskStatus
+	Type      TaskType
 	StartTime int64
 }
 
 type NeedWorkArgs struct{}
 type NeedWorkReply struct {
-	Task      Task
+	Task      *Task
 	ReduceCnt int
 }
 type FinishWorkArgs struct {
-	TaskId   int
-	ReduceId int
-	Type     TaskType
+	Id       int
+	TaskType TaskType
+	FileName string
 }
 type FinishWorkReply struct{}
 

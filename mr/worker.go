@@ -1,14 +1,15 @@
 package mr
 
 import (
+	"6.5840/logger"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
-	"log"
-	"net/rpc"
 	"os"
 	"sort"
 )
+import "log"
+import "net/rpc"
+import "hash/fnv"
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -44,23 +45,29 @@ func Worker(mapf func(string, string) []KeyValue,
 	for {
 		// wait for the coordinator to assign a task
 		if err := AskOneTask(args, reply); err != nil {
-			log.Fatalf("cannot get task from coordinator")
+			logger.Debug(logger.DError, "ask one task failed: %v", err)
 		}
 		switch reply.Task.Type {
-		case "map":
+		case MapTask:
+			logger.Debug(logger.DInfo, "start map task, map id: %v", reply.Task.TaskId)
 			DoMapTask(mapf, reply)
 			TaskDone(&FinishWorkArgs{
-				TaskId: reply.Task.TaskId,
-				Type:   "map",
+				Id:       reply.Task.TaskId,
+				TaskType: MapTask,
+				FileName: fmt.Sprintf("mr-%v-*", reply.Task.TaskId),
 			})
-		case "reduce":
+			logger.Debug(logger.DInfo, "map task done, map id: %v", reply.Task.TaskId)
+		case ReduceTask:
+			logger.Debug(logger.DInfo, "start reduce task, reduce id: %v", reply.Task.ReduceId)
 			DoReduceTask(reducef, reply)
 			TaskDone(&FinishWorkArgs{
-				ReduceId: reply.Task.ReduceId,
-				Type:     "reduce",
+				Id:       reply.Task.ReduceId,
+				TaskType: ReduceTask,
+				FileName: fmt.Sprintf("mr-out-%v", reply.Task.ReduceId),
 			})
-		case "done":
-			fmt.Println("all tasks done!")
+			logger.Debug(logger.DInfo, "reduce task done, reduce id: %v", reply.Task.ReduceId)
+		case Done:
+			logger.Debug(logger.DInfo, "receive done task")
 			return
 		}
 	}
@@ -75,35 +82,34 @@ func DoMapTask(mapf func(string, string) []KeyValue, reply *NeedWorkReply) {
 	filename := reply.Task.FileName
 	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatalf("cannot open %v", filename)
+		logger.Debug(logger.DError, "cannot open %v", filename)
 	}
 	content, err := os.ReadFile(filename)
 	if err != nil {
-		log.Fatalf("cannot read %v", filename)
+		logger.Debug(logger.DError, "cannot read %v", filename)
 	}
 	file.Close()
 	kva := mapf(filename, string(content))
 
 	for _, kv := range kva {
 		reduceId := ihash(kv.Key) % reply.ReduceCnt
-		tfName := fmt.Sprintf("mr-%v-%v", reply.Task.TaskId, reduceId)
-		tf, _ := os.OpenFile(tfName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		enc := json.NewEncoder(tf)
+		midFileName := fmt.Sprintf("mr-%v-%v", reply.Task.TaskId, reduceId)
+		midFile, _ := os.OpenFile(midFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		enc := json.NewEncoder(midFile)
 		enc.Encode(&kv)
-		tf.Close()
+		midFile.Close()
 	}
-	//TaskDone(reply.Id)
 }
 
 func DoReduceTask(reducef func(string, []string) string, reply *NeedWorkReply) {
-	oname := fmt.Sprintf("mr-out-%v", reply.Task.ReduceId)
-	ofile, err := os.Create(oname)
+	dir, _ := os.Getwd()
+	tmpfile, err := os.CreateTemp(dir, "mr-out-tmpfile-")
 	if err != nil {
-		log.Fatalf("cannot create %v", oname)
+		logger.Debug(logger.DError, "create tmpfile failed: %v", err)
 	}
 
+	// shuffle
 	kva := []KeyValue{}
-	// todo oops!
 	for i := 0; i < reply.ReduceCnt; i++ {
 		tfName := fmt.Sprintf("mr-%v-%v", i, reply.Task.ReduceId)
 		tf, _ := os.Open(tfName)
@@ -132,13 +138,16 @@ func DoReduceTask(reducef func(string, []string) string, reply *NeedWorkReply) {
 		output := reducef(kva[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
-
+		fmt.Fprintf(tmpfile, "%v %v\n", kva[i].Key, output)
 		i = j
 	}
-	ofile.Close()
-	//TaskDone(reply.Id)
+	tmpfile.Close()
+	oname := fmt.Sprintf("mr-out-%v", reply.Task.ReduceId)
 
+	if err = os.Rename(tmpfile.Name(), oname); err != nil {
+		logger.Debug(logger.DError, "rename tmpfile failed: %v", err)
+		os.Remove(tmpfile.Name())
+	}
 }
 
 func AskOneTask(args *NeedWorkArgs, reply *NeedWorkReply) error {
@@ -173,6 +182,5 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
 	return false
 }
