@@ -131,6 +131,8 @@ sleep 1
 maybe_quiet $TIMEOUT ../mrworker ../../mrapps/indexer.so &
 maybe_quiet $TIMEOUT ../mrworker ../../mrapps/indexer.so
 
+wait
+
 sort mr-out* | grep . > mr-indexer-all
 if cmp mr-indexer-all mr-correct-indexer.txt
 then
@@ -153,6 +155,8 @@ sleep 1
 
 maybe_quiet $TIMEOUT ../mrworker ../../mrapps/mtiming.so &
 maybe_quiet $TIMEOUT ../mrworker ../../mrapps/mtiming.so
+
+wait
 
 NT=`cat mr-out* | grep '^times-' | wc -l | sed 's/ //g'`
 if [ "$NT" != "2" ]
@@ -185,6 +189,8 @@ sleep 1
 maybe_quiet $TIMEOUT ../mrworker ../../mrapps/rtiming.so  &
 maybe_quiet $TIMEOUT ../mrworker ../../mrapps/rtiming.so
 
+wait
+
 NT=`cat mr-out* | grep '^[a-z] 2' | wc -l | sed 's/ //g'`
 if [ "$NT" -lt "2" ]
 then
@@ -209,6 +215,8 @@ maybe_quiet $TIMEOUT ../mrworker ../../mrapps/jobcount.so &
 maybe_quiet $TIMEOUT ../mrworker ../../mrapps/jobcount.so
 maybe_quiet $TIMEOUT ../mrworker ../../mrapps/jobcount.so &
 maybe_quiet $TIMEOUT ../mrworker ../../mrapps/jobcount.so
+
+wait
 
 NT=`cat mr-out* | awk '{print $2}'`
 if [ "$NT" -eq "8" ]
@@ -241,6 +249,8 @@ sleep 1
 (maybe_quiet $TIMEOUT ../mrworker ../../mrapps/early_exit.so; touch $DF) &
 (maybe_quiet $TIMEOUT ../mrworker ../../mrapps/early_exit.so; touch $DF) &
 (maybe_quiet $TIMEOUT ../mrworker ../../mrapps/early_exit.so; touch $DF) &
+
+wait
 
 # wait for any of the coord or workers to exit.
 # `jobs` ensures that any completed old processes from other tests
