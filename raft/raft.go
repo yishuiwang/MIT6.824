@@ -194,6 +194,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	Debug(dInfo, "S%d receive vote request from S%d", rf.me, args.Id)
+	Debug(dInfo, "S%d info: term: %d, votedFor: %d", rf.me, rf.CurrentTerm, rf.VotedFor)
 	// Reply false if term < currentTerm (§5.1)
 	if args.Term < rf.CurrentTerm {
 		reply.VoteGranted = false
@@ -205,47 +206,42 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// If votedFor is null or candidateId, and candidate's logs are at
 	// least as up-to-date as receiver's logs, grant vote (§5.2, §5.4)
 	//if (rf.VotedFor == -1 || rf.VotedFor == args.Id) && rf.isUpToDate(args.LastLogIndex, args.LastLogTerm) {
-	if rf.VotedFor == -1 || rf.VotedFor == args.Id {
-		rf.VotedFor = args.Id
-		rf.CurrentTerm = args.Term
-		reply.VoteGranted = true
-		Debug(dInfo, "S%d vote for S%d", rf.me, args.Id)
-		return
-	}
+	//if rf.VotedFor == -1 || rf.VotedFor == args.Id {
+	rf.VotedFor = args.Id
+	rf.CurrentTerm = args.Term
+	reply.VoteGranted = true
+	Debug(dInfo, "S%d vote for S%d", rf.me, args.Id)
+	return
+	//}
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// 判断任期是否过期
+	if args.Term < rf.CurrentTerm {
+		reply.Term = rf.CurrentTerm
+		reply.Success = false
+		Debug(dInfo, "S%d reject heartbeat from S%d", rf.me, args.LeaderId)
+		return
+	}
 
 	// 如果是Leader发送的心跳
 	if args.IsHeartbeat {
 		// 检查自身状态
+		Debug(dInfo, "S%d receive heartbeat from S%d", rf.me, args.LeaderId)
 		switch rf.State {
 		case Follower:
-			// 如果是Follower，重置选举超时
-			Debug(dInfo, "S%d receive heartbeat from S%d", rf.me, args.LeaderId)
 			rf.ElectionTimer.Reset(randTimeout(150, 300))
 		case Candidate:
-			// 如果是Candidate
-			if args.Term > rf.CurrentTerm {
-				// 如果term比自己大，变成Follower
-				rf.switchRole(Follower)
-				rf.CurrentTerm = args.Term
-				rf.ElectionTimer.Reset(randTimeout(150, 300))
-			} else {
-				// 拒绝掉这个RPC并接着保持自身的candidate状态
-				Debug(dInfo, "S%d reject heartbeat from S%d", rf.me, args.LeaderId)
-			}
+			rf.switchRole(Follower)
+			rf.CurrentTerm = args.Term
+			rf.ElectionTimer.Reset(randTimeout(150, 300))
 		case Leader:
-			// TODO
+			rf.switchRole(Follower)
+			rf.CurrentTerm = args.Term
+			rf.ElectionTimer.Reset(randTimeout(150, 300))
 		}
-	}
-
-	if args.Term < rf.CurrentTerm {
-		reply.Term = rf.CurrentTerm
-		reply.Success = false
-		return
 	}
 
 	// Reply false if logs doesn't contain an entry at prevLogIndex
@@ -296,27 +292,27 @@ func (rf *Raft) ticker() {
 		select {
 		case <-rf.ElectionTimer.C:
 			// 如果选举超时，发起选举
-			switch rf.State {
-			case Follower:
+			rf.mu.Lock()
+			if rf.State == Follower || rf.State == Candidate {
 				rf.switchRole(Candidate)
+				rf.mu.Unlock()
 				rf.ElectLeader()
-			case Candidate:
-				rf.ElectLeader()
-			case Leader:
-				continue
+			} else {
+				rf.mu.Unlock()
 			}
 		case <-rf.HeartbeatTimer.C:
+			// 如果是Leader，发送心跳
+			rf.mu.Lock()
+			if rf.State == Leader {
+				rf.heartbeat()
+			}
+			rf.mu.Unlock()
 			continue
 		}
-
 	}
 }
 
 func (rf *Raft) ElectLeader() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.CurrentTerm++
 	rf.VotedFor = rf.me
 	rf.ElectionTimer.Reset(randTimeout(150, 300))
 
@@ -324,8 +320,9 @@ func (rf *Raft) ElectLeader() {
 
 	if rf.askForVote() {
 		Debug(dLeader, "S%d become leader", rf.me)
+		Debug(dLeader, "S%d: Term: %d, VotedFor: %d", rf.me, rf.CurrentTerm, rf.VotedFor)
 		rf.switchRole(Leader)
-		go rf.heartbeat()
+		rf.heartbeat()
 	} else {
 		Debug(dInfo, "S%d stay candidate", rf.me)
 	}
@@ -340,7 +337,6 @@ func (rf *Raft) askForVote() bool {
 		if i != rf.me {
 			wg.Add(1)
 			go func(index int) {
-				defer wg.Done()
 				args := &RequestVoteArgs{
 					Term: rf.CurrentTerm,
 					Id:   rf.me,
@@ -373,20 +369,20 @@ func (rf *Raft) askForVote() bool {
 }
 
 func (rf *Raft) heartbeat() {
-	for rf.killed() == false && rf.State == Leader {
-		// 每隔一段时间向所有节点发送心跳
-		for i := 0; i < len(rf.peers); i++ {
-			args := &AppendEntriesArgs{
-				IsHeartbeat: true,
-			}
-			reply := &AppendEntriesReply{}
-			if i != rf.me {
-				Debug(dLeader, "S%d send heartbeat to S%d", rf.me, i)
-				go rf.sendAppendEntries(i, args, reply)
-			}
+	// 向所有节点发送心跳
+	for i := 0; i < len(rf.peers); i++ {
+		args := &AppendEntriesArgs{
+			Term:        rf.CurrentTerm,
+			LeaderId:    rf.me,
+			IsHeartbeat: true,
 		}
-		time.Sleep(HeartbeatInterval)
+		reply := &AppendEntriesReply{}
+		if i != rf.me {
+			Debug(dLeader, "S%d send heartbeat to S%d", rf.me, i)
+			go rf.sendAppendEntries(i, args, reply)
+		}
 	}
+	rf.HeartbeatTimer.Reset(HeartbeatInterval)
 }
 
 func (rf *Raft) switchRole(role state) {
@@ -397,6 +393,9 @@ func (rf *Raft) switchRole(role state) {
 	// TODO
 	if role == Follower {
 		rf.VotedFor = -1
+	}
+	if role == Candidate {
+		rf.CurrentTerm++
 	}
 	//Debug(dInfo, "S%d switch to %d", rf.me, role)
 }
