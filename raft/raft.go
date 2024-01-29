@@ -209,8 +209,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.CurrentTerm {
 		Debug(dVote, "S%d update term from %d to %d", rf.me, rf.CurrentTerm, args.Term)
 		rf.CurrentTerm = args.Term
-		rf.VotedFor = args.Id
 		rf.switchRole(Follower)
+		// attention: 一定要重设VoteFor和ElectionTimer
+		rf.VotedFor = args.Id
+		rf.ElectionTimer.Reset(randTimeout(150, 300))
 	}
 
 	// If votedFor is null or candidateId, and candidate’s log is at
@@ -262,7 +264,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2 Reply false if logs don’t contain an entry at prevLogIndex
 	if args.PrevLogIndex >= len(rf.Log) {
-		Debug(dLog2, "S%d log: %v,pre log index:", rf.me, rf.Log, args.PrevLogIndex)
+		Debug(dLog2, "S%d log: %v,pre log index: %d", rf.me, rf.Log, args.PrevLogIndex)
 		return
 	}
 	if rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -274,16 +276,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// but different terms), delete the existing entry and all that
 	// follow it
 	i, j := args.PrevLogIndex+1, 0
+	if len(args.Entries) > 0 {
+		Debug(dLog2, "S%d log: %v", rf.me, rf.Log)
+		Debug(dLog2, "S%d args log: %v", rf.me, args.Entries)
+	}
 	for ; i < len(rf.Log) && j < len(args.Entries); i, j = i+1, j+1 {
 		if rf.Log[i].Term != args.Entries[j].Term {
+			// TODO rule 3 实现
+			rf.Log = rf.Log[:i]
 			break
 		}
 	}
-	rf.Log = rf.Log[:i]
+	// 4 Append any new entries not already in the logs
 	args.Entries = args.Entries[j:]
 	Debug(dLog, "S%d append log:%v", rf.me, args.Entries)
-	// 4 Append any new entries not already in the logs
 	rf.Log = append(rf.Log, args.Entries...)
+	Debug(dLog, "S%d log:%v", rf.me, rf.Log)
 
 	// 5 If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
@@ -338,7 +346,6 @@ func (rf *Raft) applyLogsLoop(applyCh chan ApplyMsg) {
 		rf.mu.Lock()
 		msg := make([]ApplyMsg, 0)
 		for rf.CommitIndex > rf.LastApplied {
-			//Debug(dLog2, "S%d log: %v", rf.me, rf.Log)
 			rf.LastApplied++
 			msg = append(msg, ApplyMsg{
 				CommandValid: true,
@@ -400,24 +407,22 @@ func (rf *Raft) ElectLeader() {
 	}
 }
 
+// TODO 处理RPC回复之前先判断，如果自己不再是Candidate了则直接返回
 func (rf *Raft) askForVote() bool {
 	voteCh := make(chan bool, len(rf.peers))
 	result := 1
 	rf.mu.Lock()
-	term := rf.CurrentTerm
-	LogIndex := rf.LastApplied
-	LogTerm := rf.Log[len(rf.Log)-1].Term
+	args := &RequestVoteArgs{
+		Term:         rf.CurrentTerm,
+		Id:           rf.me,
+		LastLogIndex: len(rf.Log) - 1,
+		LastLogTerm:  rf.Log[len(rf.Log)-1].Term,
+	}
 	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			go func(index int) {
-				args := &RequestVoteArgs{
-					Term:         term,
-					Id:           rf.me,
-					LastLogIndex: LogIndex,
-					LastLogTerm:  LogTerm,
-				}
 				reply := &RequestVoteReply{}
 				Debug(dVote, "S%d send vote request to S%d", rf.me, index)
 				if rf.sendRequestVote(index, args, reply) {
@@ -456,23 +461,22 @@ func (rf *Raft) askForAppend(heartbeat bool) {
 		// If last log index ≥ nextIndex for a follower:
 		// send AppendEntries RPC with log entries starting at nextIndex
 		if len(rf.Log) >= rf.NextIndex[i] || heartbeat {
-			// 从nextIndex开始复制日志
 			nextIndex := rf.NextIndex[i]
 			entries := rf.Log[nextIndex:]
 			args := &AppendEntriesArgs{
 				Term:         rf.CurrentTerm,
 				LeaderId:     rf.me,
 				LeaderCommit: rf.CommitIndex,
-				// nextIndex - 1是前一条日志的索引
 				PrevLogIndex: rf.NextIndex[i] - 1,
 				PrevLogTerm:  rf.Log[nextIndex-1].Term,
 				Entries:      entries,
 			}
 			if heartbeat {
 				Debug(dTimer, "S%d send heartbeat to S%d", rf.me, i)
+			} else {
+				Debug(dLog, "S%d send log %v to S%d", rf.me, entries, i)
 			}
 			// 并发地向所有Follower节点复制数据并等待接收响应ACK
-			//Debug(dLog, "S%d send log %v to S%d", rf.me, entries, i)
 			go rf.sendLog(i, args)
 		}
 	}
@@ -489,8 +493,12 @@ func (rf *Raft) sendLog(index int, args *AppendEntriesArgs) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// 处理RPC回复之前先判断
+	if rf.State != Leader || rf.CurrentTerm != args.Term {
+		Debug(dError, "S%d is not leader, cant retry", rf.me)
+		return
+	}
 	Debug(dLog, "S%d receive reply from S%d,res: %v", rf.me, index, reply.Success)
-
 	if rf.CurrentTerm < reply.Term {
 		// 跟进任期，等待选举
 		rf.CurrentTerm = reply.Term
@@ -501,8 +509,9 @@ func (rf *Raft) sendLog(index int, args *AppendEntriesArgs) {
 
 	if reply.Success {
 		// If successful: update nextIndex and matchIndex for follower (§5.3)
-		rf.NextIndex[index] = len(rf.Log)
-		rf.MatchIndex[index] = len(rf.Log) - 1
+		// 确保matchIndex单调递增
+		rf.MatchIndex[index] = max(rf.MatchIndex[index], args.PrevLogIndex+len(args.Entries))
+		rf.NextIndex[index] = rf.MatchIndex[index] + 1
 		// if there exists an N such that N > commitIndex, a majority
 		// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 		// set commitIndex = N (§5.3, §5.4).
@@ -523,11 +532,6 @@ func (rf *Raft) sendLog(index int, args *AppendEntriesArgs) {
 		}
 		return
 	} else {
-		// TODO 关注是否是conflict而不是state
-		if rf.State != Leader {
-			Debug(dError, "S%d is not leader, cant retry", rf.me)
-			return
-		}
 		// If AppendEntries fails because of log inconsistency:
 		// decrement nextIndex and retry (§5.3)
 		// 防止出现负数
@@ -544,6 +548,7 @@ func (rf *Raft) sendLog(index int, args *AppendEntriesArgs) {
 			Entries:      entries,
 		}
 		Debug(dLog2, "S%d retry append entries to S%d", rf.me, index)
+		Debug(dLog2, "S%d retry log %v", rf.me, entries)
 		go rf.sendLog(index, newArgs)
 	}
 	return
