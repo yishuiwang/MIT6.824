@@ -180,8 +180,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // example RequestVote RPC reply structure.
@@ -218,7 +220,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// attention: 一定要重设VoteFor和ElectionTimer
 		rf.VotedFor = args.Id
 		rf.persist()
-		rf.ElectionTimer.Reset(randTimeout(250, 400))
+		rf.ElectionTimer.Reset(randTimeout())
 	}
 
 	// If votedFor is null or candidateId, and candidate’s log is at
@@ -264,33 +266,42 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.CurrentTerm = args.Term
 		rf.persist()
 	}
-	//rf.switchRole(Follower)
-	//rf.CurrentTerm = args.Term
 
 	reply.Term = rf.CurrentTerm
 	reply.Success = false
 
 	// 回应心跳
-	rf.ElectionTimer.Reset(randTimeout(250, 400))
+	rf.ElectionTimer.Reset(randTimeout())
 	if len(args.Entries) == 0 {
 		Debug(dTimer, "S%d receive heartbeat from S%d,reset election", rf.me, args.LeaderId)
 	}
 
 	// 2 Reply false if logs don’t contain an entry at prevLogIndex
 	if args.PrevLogIndex >= len(rf.Log) {
-		//Debug(dLog2, "S%d log: %v,pre log index: %d", rf.me, rf.Log, args.PrevLogIndex)
+		// If a follower does not have prevLogIndex in its log,
+		// it should return with conflictIndex = len(log) and conflictTerm = None.
+		reply.ConflictIndex = len(rf.Log)
+		reply.ConflictTerm = -1
 		return
 	}
 	if rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		Debug(dLog2, "S%d Prev log entries do not match. Ask leader to retry.", rf.me)
+		// If a follower does have prevLogIndex in its log, but the term does not match,
+		// it should return conflictTerm = log[prevLogIndex].Term,
+		// and then search its log for the first index whose entry has term equal to conflictTerm.
+		reply.ConflictTerm = rf.Log[args.PrevLogIndex].Term
+		for i := args.PrevLogIndex; i >= 0; i-- {
+			if rf.Log[i].Term == reply.ConflictTerm {
+				reply.ConflictIndex = i
+				break
+			}
+		}
 		return
 	}
 
 	// 3 If an existing entry conflicts with a new one (same index
-	// but different terms), delete the existing entry and all that
-	// follow it
+	// but different terms), delete the existing entry and all that follow it
 	i, j := args.PrevLogIndex+1, 0
-	// TODO conflict 会截取第一个不同日志
+	// 删除这个冲突的日志项及其往后的日志
 	for ; i < len(rf.Log) && j < len(args.Entries); i, j = i+1, j+1 {
 		if rf.Log[i].Term != args.Entries[j].Term {
 			rf.Log = rf.Log[:i]
@@ -299,13 +310,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// 4 Append any new entries not already in the logs
 	args.Entries = args.Entries[j:]
-	Debug(dLog, "S%d append log:%v", rf.me, args.Entries)
 	rf.Log = append(rf.Log, args.Entries...)
 	rf.persist()
-	Debug(dLog, "S%d log:%v", rf.me, rf.Log)
 
-	// 5 If leaderCommit > commitIndex, set commitIndex =
-	// min(leaderCommit, index of last new entry)
+	// 5 If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.CommitIndex {
 		rf.CommitIndex = min(args.LeaderCommit, len(rf.Log)-1)
 		Debug(dCommit, "S%d commitIndex: %d,leaderCommit: %d", rf.me, rf.CommitIndex, args.LeaderCommit)
@@ -403,7 +411,7 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) ElectLeader() {
 	rf.mu.Lock()
-	rf.ElectionTimer.Reset(randTimeout(250, 400))
+	rf.ElectionTimer.Reset(randTimeout())
 	Debug(dVote, "Term: %d, S%d candidate begin elect ", rf.CurrentTerm, rf.me)
 	rf.mu.Unlock()
 
@@ -519,7 +527,6 @@ func (rf *Raft) sendLog(index int, args *AppendEntriesArgs) {
 	reply := &AppendEntriesReply{}
 	ok := rf.sendAppendEntries(index, args, reply)
 	if !ok {
-		Debug(dLog, "S%d send log to S%d timeout", rf.me, index)
 		return
 	}
 
@@ -567,17 +574,34 @@ func (rf *Raft) sendLog(index int, args *AppendEntriesArgs) {
 	} else {
 		// If AppendEntries fails because of log inconsistency:
 		// decrement nextIndex and retry (§5.3)
-		// todo 加速日志回溯优化 conflictIndex conflictTerm
-		rf.NextIndex[index] = max(1, rf.NextIndex[index]-1)
+
+		// Upon receiving a conflict response, the leader should first search its log for conflictTerm.
+		// If it finds an entry in its log with that term,
+		// it should set nextIndex to be the one beyond the index of the last entry in that term in its log.
+		if reply.ConflictTerm != -1 {
+			found := false
+			for i := len(rf.Log) - 1; i > 0; i-- {
+				if rf.Log[i].Term == reply.ConflictTerm {
+					rf.NextIndex[index] = i + 1
+					found = true
+					break
+				}
+			}
+			if !found {
+				rf.NextIndex[index] = reply.ConflictIndex
+			}
+		} else {
+			// If it does not find an entry with that term, it should set nextIndex = conflictIndex.
+			rf.NextIndex[index] = reply.ConflictIndex
+		}
 		nextIndex := max(1, rf.NextIndex[index])
-		entries := rf.Log[nextIndex:]
 		newArgs := &AppendEntriesArgs{
 			Term:         rf.CurrentTerm,
 			LeaderId:     rf.me,
 			LeaderCommit: rf.CommitIndex,
 			PrevLogIndex: rf.NextIndex[index] - 1,
 			PrevLogTerm:  rf.Log[nextIndex-1].Term,
-			Entries:      entries,
+			Entries:      rf.Log[nextIndex:],
 		}
 		Debug(dLog2, "S%d retry append entries to S%d", rf.me, index)
 		go rf.sendLog(index, newArgs)
@@ -681,7 +705,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.CurrentTerm = 0
 	rf.VotedFor = -1
 	rf.State = Follower
-	rf.ElectionTimer = time.NewTimer(randTimeout(250, 400))
+	rf.ElectionTimer = time.NewTimer(randTimeout())
 	//rf.ElectionTimer.Reset(randTimeout(250, 400))
 	rf.HeartbeatTimer = time.NewTimer(HeartbeatInterval)
 
@@ -710,8 +734,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func randTimeout(min, max int) time.Duration {
+func randTimeout() time.Duration {
 	rand.NewSource(time.Now().UnixNano())
-	// 介于max和min之间的随机数
-	return time.Duration(rand.Intn(max-min)+min) * time.Millisecond
+	low := 150
+	high := 300
+	return time.Duration(rand.Intn(high-low)+low) * time.Millisecond
 }
